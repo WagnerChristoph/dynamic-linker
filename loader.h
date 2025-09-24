@@ -83,6 +83,8 @@ struct ElfModule {
   uint64_t num_rel;
   Elf64_Rela * rela;
   uint64_t num_rela;
+  Elf64_Relr * relr;
+  uint64_t num_relr;
   TLS_Block_t * tls_info;
 
   uint64_t preinit_arr_sz;
@@ -112,6 +114,8 @@ typedef struct {
   uint64_t num_rel;
   Elf64_Rela * rela;
   uint64_t num_rela;
+  Elf64_Relr * relr;
+  uint64_t num_relr;
 
   uint64_t preinit_arr_sz;
   uint64_t init_arr_sz;

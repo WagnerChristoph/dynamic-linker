@@ -32,6 +32,7 @@ finalization routines are executed and the program's returned value is return.
  - basic TLS implementation
  - implementation of most (common) dynamic relocation types (except 'R_AARCH64_TLSDESC' 'R_AARCH64_COPY' and PAuth ABI Extension's)
  - IFUNC (relocation type 'R_AARCH64_IRELATIVE') support
+ - RELR relocation (compressed relative relocations) support
  - program execution on separate stack
 
 Because the (glibc) libc, threads and dynamic linker implementation are tightly coupled and used common internal data structures (and are not independent 
@@ -412,6 +413,52 @@ int reloc_rel(ElfModule *m, Elf64_Rel * rel, uint64_t * result) {
     return 0;
 }
 
+int reloc_relr(ElfModule *m, Elf64_Relr * relr, int size) {
+    // handle new RELR-relocation, which are compressed REL (implicit addend stored at relocated place) relative relocations
+    // https://gabi.xinuos.com/elf/06-reloc.html#relative-relocation-table
+    // https://dram.page/p/relative-relocs-explained/
+
+    // the distance between the previous address entry and the word which the LSB of the current bitmap entry refers to
+    int dist = 1;  
+    uint64_t p = 0;  // the previously seen address entry, to which the possible following bitmap entry words refer to
+    for (size_t i = 0; i < size; i++) {
+        uint64_t e = (uint64_t) relr[i];  // current entry
+        if (!(e & 1ull)) {  // if LSB is cleared, entry is an address entry
+            dist = 1;  // reset distance for possible next bitmap entry word
+            p = e;  // set current address entry
+            *(uint64_t *)(e + m->map_offset) += m->map_offset;  // apply relative relocation
+        } else {
+            for (size_t i = 0; i < 63; i++) {  // iterate over all (except LSB) bits
+                if ((e >> (i+1)) & 1ull) {  // if bit is set
+                    *((uint64_t *)(p + m->map_offset) + dist + i) += m->map_offset;  // apply relative relocation
+                }
+            }
+            dist += 63;  // distance for next bitmap word is increased by 63
+        }
+    }
+    return 0;
+
+
+    // uint64_t * p = NULL;  // the relocated place
+    // int pos = 0;
+    // Elf64_Relr a = relr[pos];
+    // int dist = 1;
+    // if (!(a & 1ull)) {
+    //     p = (uint64_t*)(a + m->map_offset);
+    //     *p += m->map_offset;
+    // } else {
+    //     uint64_t e = a;
+    //     for (size_t i = 0; i < 63; i++){
+    //         if ((e >> (i+1)) & 1ull) {
+    //             // relocate
+    //             p = (uint64_t*) (a + dist + m + m->map_offset);
+    //             *p += m->map_offset;
+    //         }
+    //     }
+    //     dist += 63;
+        
+    // }
+}
 
 
 /**
@@ -483,6 +530,13 @@ int process_relocs(ElfModule * m, void * n) {
             }
         }
         printf("processed %ld RELA relocations for module %d\n", m->num_rela, m->module_id);
+    }
+    if (m->relr) {
+        if (reloc_relr(m, m->relr, m->num_relr)) {
+            fprintf(stderr, "error processing RELR relocations in module %s (id %d)\n", m->soname, m->module_id);
+            return -1;
+        }
+        printf("processed RELR relocations in module %s (id %d\n", m->soname, m->module_id);
     }
     
     return 0;
@@ -959,6 +1013,8 @@ DynInfo * parse_dynamic(Elf64_Dyn * dyn, uint64_t offset) {
     uint64_t num_rel = 0;  // number of entries in the REL relocation table
     Elf64_Rela * rela = NULL;  // address of the dynamic relocation table of the RELA type
     uint64_t num_rela = 0;  // number of entries in the RELA relocation table
+    Elf64_Relr * relr = NULL;  // address of the RELR relocation table
+    uint64_t num_relr = 0;  // number of words in the relr section/table
 
     uint64_t preinit_arr_sz = 0;
     uint64_t init_arr_sz = 0;
@@ -998,6 +1054,8 @@ DynInfo * parse_dynamic(Elf64_Dyn * dyn, uint64_t offset) {
             jmprel = (uint64_t*) (offset + cur->d_un.d_ptr);
         } else if (cur->d_tag == DT_REL) {
             rel = (Elf64_Rel*) (offset + cur->d_un.d_ptr);
+        } else if (cur->d_tag == DT_RELR) {
+            relr = (Elf64_Relr*) (offset + cur->d_un.d_ptr);
         } else if (cur->d_tag == DT_RELA) {
             rela = (Elf64_Rela*) (offset + cur->d_un.d_ptr);
         } else if (cur->d_tag == DT_RELSZ) {
@@ -1006,6 +1064,9 @@ DynInfo * parse_dynamic(Elf64_Dyn * dyn, uint64_t offset) {
         } else if (cur->d_tag == DT_RELASZ) {
             // ignoring DT_RELAENT
             num_rela = cur->d_un.d_val / 24;
+        } else if (cur->d_tag == DT_RELRSZ) {
+            // ignoring DT_RELRENT
+            num_relr = cur->d_un.d_val / 8;
         } else if (cur->d_tag == DT_PREINIT_ARRAYSZ) {
             preinit_arr_sz = cur->d_un.d_val;
         } else if (cur->d_tag == DT_INIT_ARRAYSZ) {
@@ -1124,8 +1185,10 @@ DynInfo * parse_dynamic(Elf64_Dyn * dyn, uint64_t offset) {
     dyn_info->jmprel = jmprel;
     dyn_info->rel = rel;
     dyn_info->rela = rela;
+    dyn_info->relr = relr;
     dyn_info->num_rel = num_rel;
     dyn_info->num_rela = num_rela;
+    dyn_info->num_relr = num_relr;
     dyn_info->preinit_arr_sz = preinit_arr_sz;
     dyn_info->init_arr_sz = init_arr_sz;
     dyn_info->fini_arr_sz = fini_arr_sz;
@@ -1327,6 +1390,8 @@ ElfModule * load_module(char* file_path, ElfLoaderCtx * ctx) {
     m->num_rel = dyn_info->num_rel;
     m->rela = dyn_info->rela;
     m->num_rela = dyn_info->num_rela;
+    m->relr = dyn_info->relr;
+    m->num_relr = dyn_info->num_relr;
     m->tls_info = tls_info;
     if (m->tls_info) {
         // add backreference to module itself
